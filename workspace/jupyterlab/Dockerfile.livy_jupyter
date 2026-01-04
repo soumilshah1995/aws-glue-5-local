@@ -1,0 +1,58 @@
+FROM public.ecr.aws/glue/aws-glue-libs:5 AS glue-base
+
+ENV LIVY_SERVER_JAVA_OPTS="--add-opens java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED"
+
+# Download Livy
+ADD --chown=hadoop:hadoop https://dlcdn.apache.org/incubator/livy/0.8.0-incubating/apache-livy-0.8.0-incubating_2.12-bin.zip ./
+
+# Install and configure Livy
+RUN unzip apache-livy-0.8.0-incubating_2.12-bin.zip && \
+rm apache-livy-0.8.0-incubating_2.12-bin.zip && \
+mv apache-livy-0.8.0-incubating_2.12-bin livy && \
+mkdir -p livy/logs && \
+cat <<EOF >> livy/conf/livy.conf
+livy.server.host = 0.0.0.0
+livy.server.port = 8998
+livy.spark.master = local
+livy.repl.enable-hive-context = true
+livy.spark.scala-version = 2.12
+EOF && \
+cat <<EOF >> livy/conf/log4j.properties
+log4j.rootCategory=INFO,console
+log4j.appender.console=org.apache.log4j.ConsoleAppender
+log4j.appender.console.target=System.err
+log4j.appender.console.layout=org.apache.log4j.PatternLayout
+log4j.appender.console.layout.ConversionPattern=%d{yy/MM/dd HH:mm:ss} %p %c{1}: %m%n
+log4j.logger.org.eclipse.jetty=WARN
+EOF
+
+# Switching to root user temporarily to install dev dependency packages
+USER root
+RUN dnf update -y && dnf install -y krb5-devel gcc python3.11-devel
+USER hadoop
+
+# Install SparkMagic and JupyterLab
+RUN export PATH=$HOME/.local/bin:$HOME/livy/bin/:$PATH && \
+printf "numpy<2\nIPython<=7.14.0\n" > /tmp/constraint.txt && \
+pip3.11 --no-cache-dir install --constraint /tmp/constraint.txt --user pytest boto==2.49.0 jupyterlab==3.6.8 IPython==7.14.0 ipykernel==5.5.6 ipywidgets==7.7.2 sparkmagic==0.21.0 jupyterlab_widgets==1.1.11 && \
+jupyter-kernelspec install --user $(pip3.11 --no-cache-dir show sparkmagic | grep Location | cut -d" " -f2)/sparkmagic/kernels/sparkkernel && \
+jupyter-kernelspec install --user $(pip3.11 --no-cache-dir show sparkmagic | grep Location | cut -d" " -f2)/sparkmagic/kernels/pysparkkernel && \
+jupyter server extension enable --user --py sparkmagic && \
+cat <<EOF >> /home/hadoop/.local/bin/entrypoint.sh
+#!/usr/bin/env bash
+mkdir -p /home/hadoop/workspace/
+livy-server start
+sleep 5
+jupyter lab --no-browser --ip=0.0.0.0 --allow-root --ServerApp.root_dir=/home/hadoop/workspace/ --ServerApp.token='' --ServerApp.password=''
+EOF
+
+# Setup Entrypoint script
+RUN chmod +x /home/hadoop/.local/bin/entrypoint.sh
+
+# Add default SparkMagic Config
+ADD --chown=hadoop:hadoop https://raw.githubusercontent.com/jupyter-incubator/sparkmagic/refs/heads/master/sparkmagic/example_config.json .sparkmagic/config.json
+
+# Update PATH var
+ENV PATH=/home/hadoop/.local/bin:/home/hadoop/livy/bin/:$PATH
+
+ENTRYPOINT ["/home/hadoop/.local/bin/entrypoint.sh"]
